@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Carrom Pro - Realistic Surface</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/cannon@0.20.0/build/cannon.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background: #1a3c3d; touch-action: none; font-family: 'Segoe UI', sans-serif; }
+        
+        /* The 3D World must stay behind everything */
+        canvas { position: fixed; top: 0; left: 0; z-index: 1; outline: none; }
+
+        /* UI Layer */
+        #ui-layer { position: relative; z-index: 10; pointer-events: none; width: 100vw; height: 100vh; display: flex; flex-direction: column; justify-content: space-between; }
+        
+        .player-row { display: flex; justify-content: space-around; padding: 20px 10px; }
+        .player-box { background: rgba(15, 15, 30, 0.9); border: 2px solid #f1c40f; padding: 12px; border-radius: 12px; color: #f1c40f; min-width: 110px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
+        .player-box.orange { border-color: #e67e22; color: #e67e22; }
+        .score-val { font-size: 28px; font-weight: bold; display: block; margin: 4px 0; }
+        
+        #controls { padding-bottom: 30px; display: flex; flex-direction: column; align-items: center; gap: 12px; }
+        .pill { background: rgba(0,0,0,0.85); color: white; padding: 6px 18px; border-radius: 20px; border: 1px solid #f1c40f; font-size: 11px; letter-spacing: 1px; text-transform: uppercase; }
+        input[type=range] { width: 75%; accent-color: #f1c40f; pointer-events: auto; height: 20px; }
+        
+        .btn-row { display: flex; gap: 8px; pointer-events: auto; }
+        .btn { background: rgba(44, 62, 80, 0.8); border: 1px solid #f1c40f; color: #f1c40f; padding: 8px 16px; border-radius: 6px; font-size: 11px; font-weight: bold; text-transform: uppercase; cursor: pointer; }
+        .btn:active { background: #f1c40f; color: black; }
+    </style>
+</head>
+<body>
+
+<div id="ui-layer">
+    <div class="player-row">
+        <div class="player-box">
+            <small>BACK</small>
+            <span class="score-val" id="score1">0</span>
+            <small>COINS: 9</small>
+        </div>
+        <div class="player-box orange">
+            <small>X BACK</small>
+            <span class="score-val" id="score2">0</span>
+            <small>COINS: 9</small>
+        </div>
+    </div>
+
+    <div id="controls">
+        <div class="pill" id="turnLabel">WHITE'S TURN</div>
+        <input type="range" id="strikerPos" min="-2.8" max="2.8" step="0.01" value="0">
+        <div class="btn-row">
+            <button class="btn" onclick="resetGame()">RESET</button>
+            <button class="btn" onclick="flipCamera()">FLIP</button>
+            <button class="btn" onclick="toggleSFX()" id="sfxBtn">SFX: ON</button>
+        </div>
+    </div>
+</div>
+
+<script>
+let scene, camera, renderer, world, striker, strikerBody;
+let pieces = [];
+let isFlipped = false;
+let audioCtx, sfxEnabled = true;
+
+function init() {
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a3c3d);
+
+    // Setup Camera - Perspective centered on the board
+    const aspect = window.innerWidth / window.innerHeight;
+    camera = new THREE.PerspectiveCamera(40, aspect, 0.1, 100);
+    camera.position.set(0, 15, 0); 
+    camera.lookAt(0, 0, 0);
+
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    document.body.appendChild(renderer.domElement);
+
+    const light = new THREE.AmbientLight(0xffffff, 1.0);
+    scene.add(light);
+
+    initPhysics();
+    createBoard();
+    resetGame();
+    setupInput();
+    animate();
+    
+    window.addEventListener('resize', onResize);
+}
+
+function initPhysics() {
+    world = new CANNON.World();
+    world.gravity.set(0, -9.8, 0);
+    world.defaultContactMaterial.friction = 0.1;
+    world.defaultContactMaterial.restitution = 0.6;
+}
+
+function createBoardTexture() {
+    const canvas = document.createElement('canvas');
+    canvas.width = 1024; canvas.height = 1024;
+    const ctx = canvas.getContext('2d');
+
+    // Surface Base
+    ctx.fillStyle = "#e8d5a7"; ctx.fillRect(0,0,1024,1024);
+    ctx.strokeStyle = "#5d4037"; ctx.lineWidth = 6;
+
+    // Corner Pockets
+    ctx.fillStyle = "#000";
+    [45, 979].forEach(x => [45, 979].forEach(y => {
+        ctx.beginPath(); ctx.arc(x, y, 65, 0, Math.PI*2); ctx.fill();
+    }));
+
+    // Circles
+    ctx.beginPath(); ctx.arc(512, 512, 130, 0, Math.PI*2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(512, 512, 145, 0, Math.PI*2); ctx.stroke();
+
+    // Striker Lines
+    const lines = [200, 824];
+    lines.forEach(y => {
+        ctx.beginPath(); ctx.moveTo(200, y); ctx.lineTo(824, y); ctx.stroke();
+        ctx.beginPath(); ctx.arc(200, y, 20, 0, Math.PI*2); ctx.stroke();
+        ctx.beginPath(); ctx.arc(824, y, 20, 0, Math.PI*2); ctx.stroke();
+    });
+
+    return new THREE.CanvasTexture(canvas);
+}
+
+function createBoard() {
+    const board = new THREE.Mesh(
+        new THREE.BoxGeometry(10, 0.4, 10),
+        new THREE.MeshStandardMaterial({ map: createBoardTexture() })
+    );
+    scene.add(board);
+
+    // Frame (Yellow Wood)
+    const frameMat = new THREE.MeshStandardMaterial({ color: 0xf1c40f });
+    const f1 = new THREE.Mesh(new THREE.BoxGeometry(11, 0.8, 0.5), frameMat);
+    f1.position.set(0, 0.2, 5.25); scene.add(f1);
+    const f2 = f1.clone(); f2.position.set(0, 0.2, -5.25); scene.add(f2);
+    const f3 = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.8, 11), frameMat);
+    f3.position.set(5.25, 0.2, 0); scene.add(f3);
+    const f4 = f3.clone(); f4.position.set(-5.25, 0.2, 0); scene.add(f4);
+
+    const floor = new CANNON.Body({ mass: 0 });
+    floor.addShape(new CANNON.Plane());
+    floor.quaternion.setFromAxisAngle(new CANNON.Vec3(1,0,0), -Math.PI/2);
+    world.addBody(floor);
+}
+
+function spawnPiece(x, z, type) {
+    let color = type === 'white' ? 0xffffff : (type === 'black' ? 0x222222 : 0xcc0000);
+    let radius = type === 'striker' ? 0.45 : 0.33;
+    if(type === 'striker') color = 0xffffff;
+
+    const mesh = new THREE.Mesh(
+        new THREE.CylinderGeometry(radius, radius, 0.2, 32),
+        new THREE.MeshStandardMaterial({ color, roughness: 0.1, metalness: 0.2 })
+    );
+    scene.add(mesh);
+
+    const body = new CANNON.Body({ mass: type === 'striker' ? 1.6 : 0.8, linearDamping: 0.65 });
+    body.addShape(new CANNON.Cylinder(radius, radius, 0.2, 32));
+    body.position.set(x, 0.5, z);
+    world.addBody(body);
+
+    if(type === 'striker') {
+        striker = mesh; strikerBody = body;
+    } else {
+        pieces.push({ mesh, body, active: true });
+    }
+}
+
+function resetGame() {
+    pieces.forEach(p => { scene.remove(p.mesh); world.remove(p.body); });
+    if(strikerBody) { scene.remove(striker); world.remove(strikerBody); }
+    pieces = [];
+
+    // Layout
+    spawnPiece(0, 0, 'red'); // Queen
+    for(let i=0; i<6; i++) {
+        let a = (i/6)*Math.PI*2;
+        spawnPiece(Math.cos(a)*0.8, Math.sin(a)*0.8, i%2==0?'white':'black');
+        spawnPiece(Math.cos(a)*1.6, Math.sin(a)*1.6, i%2==0?'black':'white');
+    }
+    spawnPiece(0, 3.2, 'striker');
+}
+
+function setupInput() {
+    const slider = document.getElementById('strikerPos');
+    slider.addEventListener('input', () => {
+        if(strikerBody.velocity.length() < 0.1) {
+            let val = parseFloat(slider.value);
+            strikerBody.position.x = isFlipped ? -val : val;
+            strikerBody.position.z = isFlipped ? -3.2 : 3.2;
+            strikerBody.velocity.set(0,0,0);
+        }
+    });
+
+    let sx, sy, isD = false;
+    window.addEventListener('touchstart', e => {
+        if(e.target.tagName !== 'CANVAS') return;
+        isD = true; sx = e.touches[0].clientX; sy = e.touches[0].clientY;
+    });
+    window.addEventListener('touchend', e => {
+        if(!isD) return; isD = false;
+        let fx = (sx - e.changedTouches[0].clientX) * 0.18;
+        let fz = (sy - e.changedTouches[0].clientY) * 0.18;
+        if(isFlipped) { fx *= -1; fz *= -1; }
+        strikerBody.applyImpulse(new CANNON.Vec3(fx, 0, fz), strikerBody.position);
+    });
+}
+
+function flipCamera() {
+    isFlipped = !isFlipped;
+    camera.rotation.z = isFlipped ? Math.PI : 0;
+    strikerBody.position.z = isFlipped ? -3.2 : 3.2;
+}
+
+function onResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+    world.step(1/60);
+    striker.position.copy(strikerBody.position);
+    pieces.forEach(p => {
+        if(!p.active) return;
+        p.mesh.position.copy(p.body.position);
+        if(Math.abs(p.body.position.x) > 4.7 || Math.abs(p.body.position.z) > 4.7) {
+            scene.remove(p.mesh); world.remove(p.body); p.active = false;
+        }
+    });
+    renderer.render(scene, camera);
+}
+
+window.addEventListener('load', () => setTimeout(init, 100));
+</script>
+</body>
+</html>
